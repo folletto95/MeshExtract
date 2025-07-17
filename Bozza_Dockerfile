@@ -1,0 +1,405 @@
+# MeshSense Data Stack (Dockerized)
+# =================================
+# Obiettivo: stack containerizzato che interroga un'istanza MeshSense (locale o remota)
+# via API HTTP, acquisisce dati dei nodi/rotte/pacchetti, li storicizza in DB,
+# e li espone tramite backend REST/WebSocket + interfaccia web filtrabile (nodi, date,
+# hop, MQTT o no, ecc.). I dati pre-estratti nel repo (Pos.txt, routeCache-*) possono
+# essere importati inizialmente.
+#
+# Riferimenti MeshSense: applicazione open‑source che monitora nodi Meshtastic, RSSI/SNR,
+# traceroute/hop e fornisce feed accessibile via browser e modalità headless (env ADDRESS,
+# PORT, ACCESS_KEY). ([affirmatech.com](https://affirmatech.com/meshsense), [affirmatech.com](https://affirmatech.com/meshsense/faq), [github.com](https://github.com/Affirmatech/MeshSense))
+# MeshSense invia traceroute automatici ai nodi attivi con rate‑limit configurabile; le
+# icone UI mostrano il JSON grezzo del nodo, utile per scraping API. ([affirmatech.com](https://affirmatech.com/meshsense/faq))
+#
+# Meshtastic supporta bridging via MQTT (pubblico e privato); opzioni includono JSON,
+# root topic, map reporting, "Okay to MQTT", ecc. Public server applica zero‑hop e
+# filtri di traffico/precisione posizione. ([meshtastic.org](https://meshtastic.org/docs/software/integrations/mqtt/), [meshtastic.org](https://meshtastic.org/docs/configuration/module/mqtt/))
+#
+# Repo dati utente MeshExtract con export manuali (Pos.txt, routeCache‑1556607561) che useremo
+# come dataset di bootstrap. ([github.com](https://github.com/folletto95/MeshExtract))
+
+
+###############################
+# 1. Architettura Servizi     #
+###############################
+#
+#            +---------------------------+
+#            |   Meshtastic Node(s)      |
+#            |  (LoRa mesh radios)       |
+#            +--------------+------------+
+#                           | BT/WiFi/Serial
+#                           v
+#                +--------------------+
+#                |  MeshSense (API)   |  <-- esecuzione headless o GUI; espone HTTP/Web UI
+#                +---------+----------+      e fornisce JSON su nodi, log, traceroute. ([affirmatech.com](https://affirmatech.com/meshsense), [github.com](https://github.com/Affirmatech/MeshSense))
+#                          | HTTP(S)
+#                          v
+#        +--------------------------------------------+
+#        | meshsense-collector (python)               |
+#        |  - Poll MeshSense API endpoints            |
+#        |  - Stream log/traceroute via WS/SSE        |
+#        |  - Normalizza & scrive su DB               |
+#        |  - Facoltativo: subscribe MQTT broker      |
+#        +----------------+---------------------------+
+#                         | SQL/Events
+#                         v
+#            +------------------------------+
+#            | PostgreSQL (+Timescale opz.) |
+#            +------------------------------+
+#                         ^
+#                         | REST/WS GraphQL
+#                         v
+#            +------------------------------+
+#            | backend-api (FastAPI)        |
+#            +------------------------------+
+#                         |
+#                         v
+#            +------------------------------+
+#            | web-ui (React/Svelte)        |
+#            |  map + tabelle + filtri       |
+#            +------------------------------+
+
+
+################################
+# 2. Schema DB (PostgreSQL)     #
+################################
+# Minimale; estendibile.
+#
+# Table: nodes
+#   id SERIAL PK
+#   node_num BIGINT UNIQUE               -- decimale (unsigned32 in range)
+#   node_hex TEXT UNIQUE                 -- esadecimale !xxxxxxxx
+#   short_name TEXT
+#   long_name  TEXT
+#   last_lat DOUBLE PRECISION
+#   last_lon DOUBLE PRECISION
+#   last_alt_m DOUBLE PRECISION
+#   first_seen TIMESTAMPTZ
+#   last_seen  TIMESTAMPTZ
+#   last_rssi  INTEGER
+#   last_snr   REAL
+#   role TEXT
+#   via_mqtt BOOLEAN DEFAULT FALSE       -- pacchetto più recente proveniente da MQTT? ([meshtastic.org](https://meshtastic.org/docs/configuration/module/mqtt/))
+#   ok_to_mqtt BOOLEAN                   -- da config node se "Okay to MQTT". ([meshtastic.org](https://meshtastic.org/docs/configuration/module/mqtt/))
+#   map_reporting_enabled BOOLEAN        -- se inviato in config map reporting. ([meshtastic.org](https://meshtastic.org/docs/configuration/module/mqtt/))
+#   raw JSONB                            -- ultimo JSON grezzo visto (MeshSense mostra). ([affirmatech.com](https://affirmatech.com/meshsense/faq))
+#
+# Table: packets
+#   id BIGSERIAL PK
+#   ts TIMESTAMPTZ NOT NULL
+#   from_node BIGINT FK nodes(node_num)
+#   to_node   BIGINT FK nodes(node_num) NULL
+#   portnum TEXT                        -- es. TextMessageApp, PositionApp, TelemetryApp... ([meshtastic.org](https://meshtastic.org/docs/software/integrations/mqtt/))
+#   channel TEXT
+#   hop_count INT
+#   rssi INT
+#   snr REAL
+#   via_mqtt BOOLEAN                    -- true se sorgente MQTT. ([meshtastic.org](https://meshtastic.org/docs/software/integrations/mqtt/), [meshtastic.org](https://meshtastic.org/docs/configuration/module/mqtt/))
+#   payload JSONB                       -- decodifica JSON se disponibile; altrimenti protobuf bin.
+#   raw BYTEA                           -- opzionale blob originale.
+#
+# Table: routes
+#   id BIGSERIAL PK
+#   target_node BIGINT FK nodes
+#   seq INT                              -- ordine hop (0=origine locale)
+#   hop_node BIGINT FK nodes
+#   direction TEXT CHECK ('towards','back')
+#   snr REAL NULL                        -- SNR associato se disponibile (MeshSense traceroute). ([affirmatech.com](https://affirmatech.com/meshsense/faq))
+#   created_at TIMESTAMPTZ DEFAULT now()
+#
+# Table: node_positions (storicizzate)
+#   id BIGSERIAL PK
+#   node_num BIGINT FK nodes
+#   ts TIMESTAMPTZ
+#   lat DOUBLE PRECISION
+#   lon DOUBLE PRECISION
+#   alt_m DOUBLE PRECISION
+#   via_mqtt BOOLEAN                     -- posizione ricevuta via MQTT map report JSON. ([meshtastic.org](https://meshtastic.org/docs/configuration/module/mqtt/))
+
+
+#############################################
+# 3. Collector: estrazione da MeshSense API #
+#############################################
+# MeshSense API (servizio Node/Express?) gira su porta 5920 per impostazione predefinita
+# in modalità sviluppo; HEADLESS usa env ADDRESS (IP del nodo Meshtastic), PORT (servizio
+# remoto), ACCESS_KEY (permessi privilegiati). ([github.com](https://github.com/Affirmatech/MeshSense))
+# MeshSense UI permette visualizzazione JSON raw per ciascun nodo; il collector può
+# richiamare quell'endpoint periodicamente per ottenere tutti i dettagli nodali. ([affirmatech.com](https://affirmatech.com/meshsense/faq))
+#
+# Strategie polling:
+#   - GET /api/nodes          -> elenco nodi + metadata
+#   - GET /api/nodes/{id}     -> JSON grezzo (quando disponibile)
+#   - GET /api/log?since=TS   -> pacchetti recenti (RSSI/SNR, testo, posizioni)
+#   - GET /api/routes/{id}    -> traceroute/hop chain se MeshSense l'ha ottenuta. ([affirmatech.com](https://affirmatech.com/meshsense/faq))
+# Nota: endpoint esatti da verificare nel codice MeshSense (cartella api/). Percorsi sopra
+# sono ipotesi ragionevoli basate su funzionalità dichiarate; regolare dopo ispezione. ([github.com](https://github.com/Affirmatech/MeshSense))
+
+
+#################################################
+# 4. Collector: ingest da MQTT (opzionale)       #
+#################################################
+# Se vuoi fondere dati dal broker MQTT Meshtastic (pubblico o privato) il collector può
+# iscriversi ai topic JSON e/o protobuf (msh/<REGION>/2/json/... ; msh/<REGION>/2/e/... ).
+# JSON contiene portnum TEXT_MESSAGE_APP, TELEMETRY_APP, NODEINFO_APP, POSITION_APP,
+# TRACEROUTE_APP ecc; utile per parsing veloce. ([meshtastic.org](https://meshtastic.org/docs/software/integrations/mqtt/), [meshtastic.org](https://meshtastic.org/docs/configuration/module/mqtt/))
+# Public server applica policy zero‑hop e filtri precisione; quindi dati parziali. ([meshtastic.org](https://meshtastic.org/docs/software/integrations/mqtt/))
+
+
+##########################################
+# 5. Filtri UI richiesti                 #
+##########################################
+# - Nodo (ricerca per short/long name o ID hex)
+# - Data/Intervallo temporale (range picker -> query packets/positions)
+# - Hop min/max (filtra su route.hop_count o rotta selezionata) ([affirmatech.com](https://affirmatech.com/meshsense/faq))
+# - Provenienza: MQTT vs LoRa diretta (via_mqtt flag). ([meshtastic.org](https://meshtastic.org/docs/configuration/module/mqtt/))
+# - Portnum / Tipo pacchetto (Text, Position, Telemetry, Routing...) ([meshtastic.org](https://meshtastic.org/docs/software/integrations/mqtt/))
+# - SNR / RSSI range
+# - Role, Map Reporting Enabled, Okay to MQTT, Encryption Enabled ecc (da config MQTT). ([meshtastic.org](https://meshtastic.org/docs/configuration/module/mqtt/))
+
+
+##########################################
+# 6. docker-compose.yml                  #
+##########################################
+# Stack base con 5 servizi: db, meshsense (facolt.), collector, backend, web.
+# NOTA: eseguire MeshSense AppImage in container richiede libfuse2; meglio estrarre
+# con --appimage-extract per ambienti non FUSE. ([github.com](https://github.com/Affirmatech/MeshSense))
+
+version: '3.9'
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: meshsense
+      POSTGRES_USER: meshsense
+      POSTGRES_PASSWORD: meshsense
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL','pg_isready -U meshsense -d meshsense']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  meshsense:
+    # Opzionale: esegue MeshSense headless in container.
+    build: ./meshsense
+    environment:
+      ADDRESS: ${MESHTASTIC_ADDRESS}
+      PORT: ${MESHTASTIC_PORT:-5920}
+      ACCESS_KEY: ${MESHSENSE_ACCESS_KEY:-}
+    volumes:
+      - meshsense_data:/opt/meshsense/data
+    ports:
+      - "${MESHSENSE_HTTP_PORT:-5920}:5920"
+    restart: unless-stopped
+
+  collector:
+    build: ./collector
+    environment:
+      MESHSENSE_BASE_URL: ${MESHSENSE_BASE_URL:-http://meshsense:5920}
+      MESHSENSE_ACCESS_KEY: ${MESHSENSE_ACCESS_KEY:-}
+      MQTT_BROKER_URL: ${MQTT_BROKER_URL:-}
+      MQTT_USERNAME: ${MQTT_USERNAME:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+      DB_DSN: postgresql+psycopg://meshsense:meshsense@db:5432/meshsense
+      POLL_INTERVAL_SEC: ${POLL_INTERVAL_SEC:-60}
+    depends_on:
+      - db
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    environment:
+      DB_DSN: postgresql+psycopg://meshsense:meshsense@db:5432/meshsense
+      CORS_ORIGINS: "*"
+    depends_on:
+      - db
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    restart: unless-stopped
+
+  web:
+    build: ./web
+    depends_on:
+      - backend
+    ports:
+      - "${WEB_PORT:-3000}:80"
+    restart: unless-stopped
+
+volumes:
+  db_data:
+  meshsense_data:
+
+
+##########################################
+# 7. Dockerfile per servizio meshsense   #
+##########################################
+# Scarica l'ultima AppImage MeshSense, la rende eseguibile e la lancia in headless.
+# Nota: se usi arm (Raspberry), cambia URL.
+# Variabili richieste: ADDRESS (IP nodo), ACCESS_KEY opzionale. ([github.com](https://github.com/Affirmatech/MeshSense))
+
+# ./meshsense/Dockerfile
+# ----------------------
+# syntax=docker/dockerfile:1
+FROM debian:bookworm-slim AS base
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates libfuse2 xvfb libgtk-3-0 libnss3 libasound2 libatk-bridge2.0-0 libgbm1 libgdk-pixbuf-2.0-0 && rm -rf /var/lib/apt/lists/*  # deps per AppImage GUI/headless. ([affirmatech.com](https://affirmatech.com/meshsense/faq), [github.com](https://github.com/Affirmatech/MeshSense))
+WORKDIR /opt/meshsense
+ARG MESHSENSE_VERSION=latest
+# esempio download generico; sostituisci con release specifica se noto
+RUN curl -L -o meshsense.AppImage "https://github.com/Affirmatech/MeshSense/releases/latest/download/meshsense-x86_64.AppImage" && chmod +x meshsense.AppImage
+
+ENV ADDRESS="" PORT="5920" ACCESS_KEY=""
+EXPOSE 5920
+ENTRYPOINT ["/bin/bash","-lc","ACCESS_KEY=$ACCESS_KEY ./meshsense.AppImage --headless"]
+
+
+###########################################################
+# 8. Dockerfile collector (python)                        #
+###########################################################
+# Librerie: httpx, paho-mqtt, fasteners, sqlalchemy, psycopg[binary],
+# tenacity retry, pydantic.
+
+# ./collector/Dockerfile
+# ----------------------
+FROM python:3.12-slim AS collector
+WORKDIR /app
+COPY collector/requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY collector /. 
+CMD ["python","-m","collector"]
+
+# collector/requirements.txt (esempio)
+# httpx==0.27.*
+# paho-mqtt==2.*
+# sqlalchemy==2.*
+# psycopg[binary]==3.*
+# pydantic==2.*
+# tenacity==9.*
+# python-dateutil
+
+# collector/__main__.py (pseudo)
+"""
+Polling loop:
+  while True:
+    scrape_nodes()
+    scrape_routes()
+    scrape_log()
+    mqtt_drain()  # non-bloccante
+    sleep(POLL_INTERVAL_SEC)
+"""
+
+
+###########################################################
+# 9. collector/api meshSense scraping helpers             #
+###########################################################
+# NOTE: endpoint paths da confermare dopo introspezione codice MeshSense/api. ([github.com](https://github.com/Affirmatech/MeshSense))
+#
+# Esempio minimal (python):
+#
+# import httpx, os
+# BASE=os.environ['MESHSENSE_BASE_URL']
+# KEY=os.getenv('MESHSENSE_ACCESS_KEY')
+#
+# async def get_nodes():
+#     r = await httpx.get(f"{BASE}/api/nodes", params={'access_key':KEY})
+#     r.raise_for_status(); return r.json()
+#
+# async def get_node_detail(node_id):
+#     r = await httpx.get(f"{BASE}/api/nodes/{node_id}", params={'access_key':KEY})
+#     r.raise_for_status(); return r.json()
+#
+# async def get_log(since_iso=None):
+#     params={'access_key':KEY}
+#     if since_iso: params['since']=since_iso
+#     r=await httpx.get(f"{BASE}/api/log", params=params)
+#     r.raise_for_status(); return r.json()
+#
+# async def get_traceroute(node_id):
+#     r=await httpx.get(f"{BASE}/api/routes/{node_id}", params={'access_key':KEY})
+#     r.raise_for_status(); return r.json()
+
+
+###########################################################
+# 10. Backend FastAPI                                     #
+###########################################################
+# Endpoint principali:
+#   GET /nodes (filtri: q, role, via_mqtt, min_hops, max_hops, active_since, map_reporting)
+#   GET /nodes/{id}
+#   GET /routes?target=...&direction=...
+#   GET /packets?node=...&date_from=...&date_to=...&via_mqtt=...&portnum=...
+#   GET /stats/hops-distribution
+#   WS  /stream (push pacchetti nuovi)
+#
+# Questi endpoint si basano sul DB popolato dal collector.
+
+
+###########################################################
+# 11. Web UI                                               #
+###########################################################
+# Scelta tech: React + Vite (o SvelteKit se preferisci; MeshSense usa Svelte). ([github.com](https://github.com/Affirmatech/MeshSense))
+# Componenti:
+#   - Mappa (Leaflet) con layer nodi & link (routes)
+#   - DataGrid tabelle con filtri client‑side + server‑side query
+#   - Pannello dettagli nodo (posizioni storiche, grafici RSSI/SNR)
+#   - Switch mostra/nascondi pacchetti MQTT, slider hop
+#   - Intervallo date (picker) -> query backend
+#   - Export CSV/GeoJSON
+#   - Live aggiornamenti via WS
+
+
+###########################################################
+# 12. Import dati iniziali (repo MeshExtract)              #
+###########################################################
+# Script bootstrap importer.py che legge Pos.txt e routeCache-*, popola tabelle nodes,
+# node_positions e routes. ([github.com](https://github.com/folletto95/MeshExtract))
+# Pos.txt contiene coordinate/nome; routeCache include catene hop & SNR. Vedi estrazione
+# precedente. ([github.com](https://github.com/folletto95/MeshExtract))
+
+
+###########################################################
+# 13. Variabili Ambiente (.env esempio)                    #
+###########################################################
+# MESHTASTIC_ADDRESS=10.0.1.20        # IP del nodo a cui MeshSense si collega. ([github.com](https://github.com/Affirmatech/MeshSense))
+# MESHTASTIC_PORT=5920                # Porta interfaccia remota MeshSense. ([github.com](https://github.com/Affirmatech/MeshSense))
+# MESHSENSE_ACCESS_KEY=supersegret0   # Chiave privilegiata per operazioni remote. ([github.com](https://github.com/Affirmatech/MeshSense))
+# MESHSENSE_BASE_URL=http://meshsense:5920
+# MQTT_BROKER_URL=mqtt://broker:1883  # Config se vuoi ingest MQTT. ([meshtastic.org](https://meshtastic.org/docs/configuration/module/mqtt/))
+# MQTT_USERNAME=...
+# MQTT_PASSWORD=...
+# POLL_INTERVAL_SEC=60
+# BACKEND_PORT=8000
+# WEB_PORT=3000
+
+
+###########################################################
+# 14. Avvio Rapido                                         #
+###########################################################
+# 1. Clona questo progetto.
+# 2. Copia .env.example in .env e imposta variabili.
+# 3. docker compose up -d --build
+# 4. Verifica logs collector per conferma connessione MeshSense & DB.
+# 5. Apri http://localhost:3000/ per UI; backend API su :8000; MeshSense su :5920. ([github.com](https://github.com/Affirmatech/MeshSense))
+
+
+###########################################################
+# 15. Licenza                                              #
+###########################################################
+# MeshSense è rilasciato sotto GPL‑3.0; se ridistribuisci binari o modifichi codice
+# devi rispettare i termini GPL (condivisione sorgenti, note licenza). ([github.com](https://github.com/Affirmatech/MeshSense))
+
+# Questo stack wrapper/collettore dovrebbe includere NOTICE e copia GPL se distribuisci
+# l'AppImage MeshSense all'interno dell'immagine. ([github.com](https://github.com/Affirmatech/MeshSense))
+
+
+###########################################################
+# 16. TODO / Prossimi Passi                                #
+###########################################################
+# [ ] Verifica endpoint reali MeshSense API e aggiorna collector.
+# [ ] Parsing JSON pacchetti (portnum -> mapping).
+# [ ] Import completo da Pos.txt & routeCache.
+# [ ] Calcolo path graph (NetworkX) per mappa link.
+# [ ] Autenticazione UI.
+# [ ] Dashboard metriche (Grafana/Prometheus sidecar?).
+
+# Fine file
