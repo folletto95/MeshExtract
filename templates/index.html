@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Meshsense Data</title>
+</head>
+<body>
+    <h1>Meshsense Data</h1>
+    <form method="get">
+        Node ID: <input type="text" name="node_id" value="{{ request.args.get('node_id', '') }}">
+        Start: <input type="datetime-local" name="start" value="{{ request.args.get('start', '') }}">
+        End: <input type="datetime-local" name="end" value="{{ request.args.get('end', '') }}">
+        Hops: <input type="number" name="hops" value="{{ request.args.get('hops', '') }}">
+        MQTT:
+        <select name="mqtt">
+            <option value="">Any</option>
+            <option value="true" {% if request.args.get('mqtt') == 'true' %}selected{% endif %}>MQTT</option>
+            <option value="false" {% if request.args.get('mqtt') == 'false' %}selected{% endif %}>Radio</option>
+        </select>
+        <input type="submit" value="Filter">
+    </form>
+    <table border="1">
+        <tr>
+            <th>Node ID</th>
+            <th>Date</th>
+            <th>Hops</th>
+            <th>MQTT</th>
+            <th>Raw</th>
+        </tr>
+        {% for row in data %}
+        <tr>
+            <td>{{ row.node_id }}</td>
+            <td>{{ row.timestamp }}</td>
+            <td>{{ row.hops }}</td>
+            <td>{{ 'MQTT' if row.mqtt else 'Radio' }}</td>
+            <td><pre>{{ row.raw_json | tojson(indent=2) }}</pre></td>
+        </tr>
+        {% endfor %}
+    </table>
+</body>
+</html>
